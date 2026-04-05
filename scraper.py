@@ -1,17 +1,20 @@
 """
-阳光高考专业信息爬虫
+阳光高考爬虫 - 完整版
+
+支持两种模式：
+1. Playwright 模式：自动爬取（需要绕过阿里云盾）
+2. 手动模式：提供数据接口，可手动导入数据
 """
-import time
-import random
+import json
+import asyncio
+import os
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, List, Dict
 from dataclasses import dataclass, asdict
-from datetime import datetime
-import json
 
 import requests
 from bs4 import BeautifulSoup
-
-import config
 
 
 @dataclass
@@ -48,238 +51,211 @@ class SchoolSpecialty:
 class GaokaoScraper:
     """阳光高考爬虫"""
 
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": config.USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-        })
+    def __init__(self, use_playwright: bool = False):
+        self.use_playwright = use_playwright
+        self.data_dir = Path("data")
+        self.data_dir.mkdir(exist_ok=True)
+        
+        if not use_playwright:
+            # 简单的 HTTP 会话（会被阿里云盾拦截，仅供测试）
+            self.session = requests.Session()
+            self.session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+            })
 
-        # 设置代理
-        if config.PROXY_HTTP:
-            self.session.proxies = {
-                "http": config.PROXY_HTTP,
-                "https": config.PROXY_HTTPS,
+    def check_waf(self) -> bool:
+        """检查是否被 WAF 拦截"""
+        try:
+            resp = self.session.get("https://gaokao.chsi.com.cn/zyk/zybk/catalog.shtml", timeout=30)
+            if resp.status_code == 412:
+                print("⚠️  被阿里云盾拦截 (HTTP 412)")
+                print("   建议：")
+                print("   1. 在本地机器运行，使用真实浏览器")
+                print("   2. 使用代理池")
+                print("   3. 或使用手动导入模式")
+                return True
+            return resp.status_code != 200
+        except Exception as e:
+            print(f"连接错误: {e}")
+            return True
+
+    async def scrape_with_playwright(self) -> Dict:
+        """使用 Playwright 爬取（需要安装 playwright）"""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            raise ImportError("请先安装: pip install playwright && playwright install chromium")
+
+        print("启动 Playwright...")
+        
+        async with async_playwright() as p:
+            # 反检测配置
+            browser = await p.chromium.launch(
+                headless=False,  # 设为 False 可能更容易绕过检测
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                ]
+            )
+            
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            
+            # 注入反检测脚本
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = {runtime: {}};
+            """)
+            
+            page = await context.new_page()
+            
+            result = {
+                "specialties": [],
+                "schools": [],
+                "scrape_time": datetime.now().isoformat(),
+                "method": "playwright"
             }
-
-    def _request(self, url: str, retries: int = config.MAX_RETRIES) -> Optional[requests.Response]:
-        """发送请求，带重试机制"""
-        for attempt in range(retries):
+            
             try:
-                # 随机延迟，避免被识别为机器人
-                delay = config.REQUEST_DELAY + random.uniform(0, 2)
-                time.sleep(delay)
+                # 访问专业目录页
+                url = "https://gaokao.chsi.com.cn/zyk/zybk/catalog.shtml"
+                print(f"正在访问: {url}")
+                
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(5)  # 等待 JS 渲染
+                
+                # TODO: 根据实际页面结构解析
+                # 这里需要你手动查看页面后补充选择器
+                # 示例：
+                # specialties = await page.query_selector_all(".specialty-item")
+                # for item in specialties:
+                #     name = await item.query_selector(".name").text_content()
+                #     ...
+                
+                print("⚠️  页面解析逻辑需要根据实际页面结构补充")
+                print("   请在浏览器中打开页面，按 F12 查看元素结构")
+                print("   然后修改 scraper.py 中的解析代码")
+                
+            except Exception as e:
+                print(f"Playwright 爬取错误: {e}")
+            
+            await browser.close()
+            return result
 
-                response = self.session.get(url, timeout=config.REQUEST_TIMEOUT)
-                response.raise_for_status()
-                return response
-
-            except requests.RequestException as e:
-                print(f"请求失败 (attempt {attempt + 1}/{retries}): {url}")
-                print(f"错误: {e}")
-
-                if attempt == retries - 1:
-                    return None
-
-        return None
-
-    def get_specialty_catalog(self) -> List[Dict]:
-        """
-        获取专业目录
-
-        返回格式: [
-            {id: "0809", name: "计算机", level: "本科", category: "工学"},
-            ...
-        ]
-        """
-        url = config.SPECIALTY_CATALOG_URL
-        response = self._request(url)
-        if not response:
-            return []
-
-        soup = BeautifulSoup(response.text, "lxml")
-
-        # 这里需要根据实际页面结构来解析
-        # 阳光高考的专业目录页面结构比较复杂，可能需要处理动态加载
-        specialties = []
-
-        # TODO: 实现页面解析逻辑
-        # 这里提供一些可能的选择器示例（需要根据实际页面调整）
-        #
-        # 示例1: 静态表格
-        # table = soup.find("table", class_="xxx-table")
-        # for row in table.find_all("tr")[1:]:
-        #     cols = row.find_all("td")
-        #     specialty_id = cols[0].text.strip()
-        #     name = cols[1].text.strip()
-        #     ...
-        #
-        # 示例2: 列表项
-        # for item in soup.select(".specialty-item"):
-        #     specialty_id = item.get("data-id")
-        #     name = item.select_one(".name").text.strip()
-        #     ...
-
-        return specialties
-
-    def get_specialty_detail(self, specialty_id: str) -> Optional[Specialty]:
-        """获取专业详情"""
-        url = config.SPECIALTY_DETAIL_URL.format(id=specialty_id)
-        response = self._request(url)
-        if not response:
-            return None
-
-        soup = BeautifulSoup(response.text, "lxml")
-
-        # TODO: 实现详情页解析逻辑
-        # 需要根据实际页面结构提取以下信息：
-        # - 专业名称
-        # - 专业介绍
-        # - 培养目标
-        # - 主干课程
-        # - 就业方向
-
-        specialty = Specialty(
-            specialty_id=specialty_id,
-            name="",
-            level="",
-            category="",
-            more_info_url=url
-        )
-
-        return specialty
-
-    def get_specialty_schools(self, specialty_id: str) -> List[SchoolSpecialty]:
-        """获取开设某专业的院校列表"""
-        url = config.SPECIALTY_SCHOOLS_URL.format(id=specialty_id)
-        response = self._request(url)
-        if not response:
-            return []
-
-        soup = BeautifulSoup(response.text, "lxml")
-
-        schools = []
-
-        # TODO: 实现院校列表解析逻辑
-        # 示例：
-        # for row in soup.select("table.school-list tr"):
-        #     school = SchoolSpecialty(
-        #         specialty_id=specialty_id,
-        #         school_name=row.select_one(".school-name").text.strip(),
-        #         ...
-        #     )
-        #     schools.append(school)
-
-        return schools
-
-    def scrape_all(self, level: str = None) -> Dict[str, List[Dict]]:
-        """
-        爬取所有专业信息
-
-        Args:
-            level: 筛选层次，"本科" 或 "专科"，None 表示全部
-
-        Returns:
-            {
-                "specialties": [专业信息列表],
-                "schools": [院校专业开设信息列表]
-            }
-        """
-        result = {
-            "specialties": [],
-            "schools": [],
-            "scrape_time": datetime.now().isoformat()
-        }
-
-        # 1. 获取专业目录
-        print("正在获取专业目录...")
-        catalog = self.get_specialty_catalog()
-
-        if level:
-            catalog = [item for item in catalog if item.get("level") == level]
-
-        print(f"找到 {len(catalog)} 个专业")
-
-        # 2. 遍历每个专业，获取详情和开设院校
-        for idx, item in enumerate(catalog, 1):
-            specialty_id = item.get("id")
-            print(f"[{idx}/{len(catalog)}] 正在爬取专业 {specialty_id}...")
-
-            # 获取专业详情
-            specialty = self.get_specialty_detail(specialty_id)
-            if specialty:
-                result["specialties"].append(specialty.to_dict())
-
-            # 获取开设院校
-            schools = self.get_specialty_schools(specialty_id)
-            result["schools"].extend([s.to_dict() for s in schools])
-
-        return result
+    def import_from_json(self, json_file: str) -> Dict:
+        """从 JSON 文件导入数据（手动模式）"""
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        # 验证数据格式
+        if "specialties" in data:
+            print(f"✓ 导入 {len(data['specialties'])} 条专业信息")
+        if "schools" in data:
+            print(f"✓ 导入 {len(data['schools'])} 条院校信息")
+        
+        return data
 
     def save_data(self, data: Dict, filename: str):
-        """保存数据到 JSON 文件"""
-        import os
-        os.makedirs(config.DATA_DIR, exist_ok=True)
+        """保存数据到文件"""
+        filepath = self.data_dir / filename
+        
+        if filename.endswith('.json'):
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        elif filename.endswith('.csv'):
+            import pandas as pd
+            
+            if "specialties" in data:
+                df = pd.DataFrame(data["specialties"])
+                df.to_csv(filepath.parent / f"specialties_{filepath.stem}.csv", 
+                         index=False, encoding="utf-8-sig")
+            
+            if "schools" in data:
+                df = pd.DataFrame(data["schools"])
+                df.to_csv(filepath.parent / f"schools_{filepath.stem}.csv", 
+                         index=False, encoding="utf-8-sig")
+        
+        print(f"✓ 数据已保存到: {filepath}")
 
-        filepath = os.path.join(config.DATA_DIR, filename)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-        print(f"数据已保存到: {filepath}")
+    def export_template(self):
+        """导出数据模板（用于手动填写）"""
+        template = {
+            "specialties": [
+                {
+                    "specialty_id": "080901",
+                    "name": "计算机科学与技术",
+                    "level": "本科",
+                    "category": "工学",
+                    "description": "专业介绍...",
+                    "training_objective": "培养目标...",
+                    "main_courses": "高等数学、线性代数...",
+                    "employment_direction": "软件开发、网络安全...",
+                }
+            ],
+            "schools": [
+                {
+                    "specialty_id": "080901",
+                    "school_name": "清华大学",
+                    "school_id": "10001",
+                    "province": "北京",
+                    "level": "本科",
+                    "feature": "双一流",
+                }
+            ],
+            "_comment": "手动填写数据后，使用 python scraper.py --import data.json 导入"
+        }
+        
+        template_file = self.data_dir / "template.json"
+        with open(template_file, "w", encoding="utf-8") as f:
+            json.dump(template, f, ensure_ascii=False, indent=2)
+        
+        print(f"✓ 数据模板已生成: {template_file}")
+        print("  请根据模板填写数据，然后使用 --import 导入")
 
 
 def main():
     import argparse
-
+    
     parser = argparse.ArgumentParser(description="阳光高考专业信息爬虫")
-    parser.add_argument("--all", action="store_true", help="爬取所有专业")
-    parser.add_argument("--level", choices=["本科", "专科"], help="只爬取指定层次")
-    parser.add_argument("--code", help="爬取指定专业代码")
-    parser.add_argument("--format", choices=["json", "csv"], default="json", help="输出格式")
-
+    parser.add_argument("--mode", choices=["auto", "playwright", "manual"], default="auto",
+                       help="运行模式: auto=自动检测, playwright=使用浏览器, manual=手动导入")
+    parser.add_argument("--import", dest="import_file", help="从 JSON 文件导入数据")
+    parser.add_argument("--template", action="store_true", help="生成数据模板")
+    parser.add_argument("--output", default="data.json", help="输出文件名")
+    
     args = parser.parse_args()
-
-    scraper = GaokaoScraper()
-
-    if args.code:
-        # 爬取单个专业
-        print(f"正在爬取专业 {args.code}...")
-        specialty = scraper.get_specialty_detail(args.code)
-        if specialty:
-            data = {
-                "specialties": [specialty.to_dict()],
-                "scrape_time": datetime.now().isoformat()
-            }
-            scraper.save_data(data, f"specialty_{args.code}.json")
-        else:
-            print("获取失败")
+    
+    scraper = GaokaoScraper(use_playwright=(args.mode == "playwright"))
+    
+    # 生成模板
+    if args.template:
+        scraper.export_template()
+        return
+    
+    # 手动导入
+    if args.import_file:
+        data = scraper.import_from_json(args.import_file)
+        scraper.save_data(data, args.output)
+        return
+    
+    # 自动模式
+    if args.mode == "auto":
+        if scraper.check_waf():
+            print("\n无法直接访问，尝试切换到 Playwright 模式...")
+            scraper.use_playwright = True
+    
+    # 使用 Playwright
+    if scraper.use_playwright:
+        data = asyncio.run(scraper.scrape_with_playwright())
+        scraper.save_data(data, args.output)
     else:
-        # 爬取所有或按层次筛选
-        data = scraper.scrape_all(level=args.level)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if args.format == "json":
-            scraper.save_data(data, f"specialties_{timestamp}.json")
-        elif args.format == "csv":
-            # 导出为 CSV
-            import pandas as pd
-            import os
-            os.makedirs(config.DATA_DIR, exist_ok=True)
-
-            specialty_df = pd.DataFrame(data["specialties"])
-            school_df = pd.DataFrame(data["schools"])
-
-            specialty_file = os.path.join(config.DATA_DIR, f"specialties_{timestamp}.csv")
-            school_file = os.path.join(config.DATA_DIR, f"schools_{timestamp}.csv")
-
-            specialty_df.to_csv(specialty_file, index=False, encoding="utf-8-sig")
-            school_df.to_csv(school_file, index=False, encoding="utf-8-sig")
-
-            print(f"专业信息已保存到: {specialty_file}")
-            print(f"院校信息已保存到: {school_file}")
+        print("请使用 --template 生成模板，手动填写后用 --import 导入")
 
 
 if __name__ == "__main__":
