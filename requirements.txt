@@ -1,0 +1,13 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-dotenv>=1.0.0
+
+# 可选：处理动态页面
+playwright>=1.40.0
+
+# 开发依赖
+pytest>=7.4.0
+black>=23.0.0
