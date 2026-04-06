@@ -2,8 +2,8 @@ name: Scrape Gaokao Specialties
 
 on:
   schedule:
-    - cron: '0 11 * * 0'
-  workflow_dispatch:
+    - cron: '0 11 * * 0'  # 每周日 11:00 UTC
+  workflow_dispatch:  # 允许手动触发
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -49,8 +49,31 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Run scraper
+        id: scrape
+        continue-on-error: true  # 即使失败也继续执行
         run: |
           python main.py --all --format json
+
+      - name: Check scrape results
+        id: check-results
+        run: |
+          # 检查是否有新数据文件生成
+          if ls data/specialties_*.json 1> /dev/null 2>&1; then
+            latest_file=$(ls -t data/specialties_*.json | head -1)
+            specialty_count=$(python -c "import json; data=json.load(open('$latest_file')); print(len(data.get('specialties', [])))")
+            echo "specialty_count=$specialty_count" >> $GITHUB_OUTPUT
+
+            if [ "$specialty_count" -eq "0" ]; then
+              echo "⚠️ 爬取失败：未获取到专业数据（可能被 WAF 拦截）"
+              echo "status=failed" >> $GITHUB_OUTPUT
+            else
+              echo "✅ 爬取成功：获取到 $specialty_count 个专业"
+              echo "status=success" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "⚠️ 未找到数据文件"
+            echo "status=no_file" >> $GITHUB_OUTPUT
+          fi
 
       - name: Get GitHub App bot user ID
         id: app-user
@@ -60,6 +83,7 @@ jobs:
           echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push data
+        if: steps.check-results.outputs.status == 'success'
         run: |
           git remote set-url origin https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository }}.git
           git config --local user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
@@ -67,3 +91,33 @@ jobs:
           git add data/
           git diff --staged --quiet || git commit -m "📊 Update specialty data - $(date +%Y-%m-%d)"
           git push origin HEAD:${{ github.ref_name }}
+
+      - name: Create issue on failure
+        if: steps.check-results.outputs.status != 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh issue create \
+            --title "⚠️ 爬虫运行失败 - $(date +%Y-%m-%d)" \
+            --body "## 爬虫运行失败
+
+          **时间**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **状态**: ${{ steps.check-results.outputs.status }}
+          **专业数量**: ${{ steps.check-results.outputs.specialty_count || '0' }}
+
+          ### 可能原因
+          - 阿里云盾 WAF 拦截（HTTP 412）
+          - 网络连接问题
+          - 页面结构变化
+
+          ### 建议解决方案
+          1. 配置代理服务器（在 Secrets 中添加 PROXY_HTTP）
+          2. 使用手动导入模式：
+             - 运行 \`python main.py --template\` 生成模板
+             - 手动访问网站收集数据
+             - 运行 \`python main.py --import data/template.json\`
+          3. 联系学信网获取官方 API
+
+          查看详细日志：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --label "automation,scraper-failure" || echo "Failed to create issue"
+

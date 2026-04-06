@@ -5,7 +5,7 @@ pandas>=2.0.0
 openpyxl>=3.1.0
 python-dotenv>=1.0.0
 
-# 可选：处理动态页面
+# 必需：处理动态页面和反爬
 playwright>=1.40.0
 
 # 开发依赖
