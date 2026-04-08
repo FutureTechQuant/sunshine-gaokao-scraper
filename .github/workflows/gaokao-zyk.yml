@@ -3,18 +3,39 @@ name: Run CHSI Web Automation
 on:
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repository
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Checkout repository with App token
         uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -25,12 +46,53 @@ jobs:
         run: python -m playwright install --with-deps chromium
 
       - name: Run automation script
+        id: run-script
+        continue-on-error: true
         run: python scripts/gaokao_zyk.py
 
-      - name: Upload outputs
+      - name: Check outputs
+        id: check-results
+        run: |
+          if [ -d output ] && [ "$(find output -type f | wc -l)" -gt 0 ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "file_count=$(find output -type f | wc -l)" >> "$GITHUB_OUTPUT"
+            echo "✅ 找到输出文件 $(find output -type f | wc -l) 个"
+          else
+            echo "status=no_file" >> "$GITHUB_OUTPUT"
+            echo "file_count=0" >> "$GITHUB_OUTPUT"
+            echo "⚠️ output/ 目录不存在或没有文件"
+          fi
+
+      - name: Prepare repo files
+        if: steps.check-results.outputs.status == 'success'
+        run: |
+          mkdir -p data/chsi-zyk
+          rsync -av --delete output/ data/chsi-zyk/
+
+      - name: Get GitHub App bot user ID
+        if: steps.check-results.outputs.status == 'success'
+        id: app-user
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push outputs
+        if: steps.check-results.outputs.status == 'success'
+        run: |
+          git remote set-url origin https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository }}.git
+          git config --local user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
+          git config --local user.email "${{ steps.app-user.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git add data/chsi-zyk/
+          git diff --staged --quiet || git commit -m "🤖 Update CHSI automation outputs - $(date +%Y-%m-%d)"
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Upload outputs artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gaokao-zyk-output
           path: output/
+          if-no-files-found: warn
           retention-days: 7
+          overwrite: true
