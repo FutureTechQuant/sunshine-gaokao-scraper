@@ -3,6 +3,10 @@ name: Run CHSI Web Automation
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: write
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   PYTHONUNBUFFERED: "1"
@@ -13,22 +17,9 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: |
-            ${{ github.event.repository.name }}
-          permission-contents: write
-
-      - name: Checkout repository with App token
+      - name: Checkout
         uses: actions/checkout@v5
         with:
-          token: ${{ steps.app-token.outputs.token }}
-          persist-credentials: true
           fetch-depth: 0
 
       - name: Set up Python
@@ -81,17 +72,20 @@ jobs:
         if: steps.check-results.outputs.status == 'success'
         shell: bash
         run: |
-          git status --short
+          echo "===== git status ====="
+          git status --short || true
+          echo
+          echo "===== synced files ====="
           find data/chsi-zyk -maxdepth 2 -type f | sort || true
 
-      - name: Configure git identity
+      - name: Configure git
         if: steps.check-results.outputs.status == 'success'
         shell: bash
         run: |
-          git config --local user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
-          git config --local user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit and push outputs to repository
+      - name: Commit and push outputs
         if: steps.check-results.outputs.status == 'success'
         shell: bash
         run: |
@@ -103,7 +97,8 @@ jobs:
             echo "No changes to commit."
           else
             git commit -m "🤖 Update CHSI automation outputs - $(date +%Y-%m-%d)"
-            git push
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin HEAD:"${GITHUB_REF_NAME}"
           fi
 
       - name: Upload outputs artifact
