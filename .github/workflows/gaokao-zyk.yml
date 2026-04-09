@@ -43,49 +43,65 @@ jobs:
           pip install -r requirements.txt
 
       - name: Install Playwright browsers
-        run: python -m playwright install --with-deps chromium
+        run: |
+          python -m playwright install --with-deps chromium
 
       - name: Run automation script
-        id: run-script
+        id: run-automation
         continue-on-error: true
-        run: python scripts/gaokao_zyk.py
+        run: |
+          python scripts/gaokao_zyk.py
 
       - name: Check outputs
         id: check-results
+        shell: bash
         run: |
+          set -euo pipefail
+
           if [ -d output ] && [ "$(find output -type f | wc -l)" -gt 0 ]; then
+            file_count=$(find output -type f | wc -l | tr -d ' ')
             echo "status=success" >> "$GITHUB_OUTPUT"
-            echo "file_count=$(find output -type f | wc -l)" >> "$GITHUB_OUTPUT"
-            echo "✅ 找到输出文件 $(find output -type f | wc -l) 个"
+            echo "file_count=$file_count" >> "$GITHUB_OUTPUT"
+            echo "✅ 找到输出文件 $file_count 个"
           else
             echo "status=no_file" >> "$GITHUB_OUTPUT"
             echo "file_count=0" >> "$GITHUB_OUTPUT"
             echo "⚠️ output/ 目录不存在或没有文件"
           fi
 
-      - name: Prepare repo files
+      - name: Prepare repository output folder
         if: steps.check-results.outputs.status == 'success'
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p data/chsi-zyk
           rsync -av --delete output/ data/chsi-zyk/
 
-      - name: Get GitHub App bot user ID
+      - name: Show changed files
         if: steps.check-results.outputs.status == 'success'
-        id: app-user
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
         run: |
-          echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+          git status --short
+          find data/chsi-zyk -maxdepth 2 -type f | sort || true
 
-      - name: Commit and push outputs
+      - name: Commit and push outputs to repository
         if: steps.check-results.outputs.status == 'success'
+        shell: bash
         run: |
+          set -euo pipefail
+
           git remote set-url origin https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/${{ github.repository }}.git
           git config --local user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
-          git config --local user.email "${{ steps.app-user.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git config --local user.email "${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
+
           git add data/chsi-zyk/
-          git diff --staged --quiet || git commit -m "🤖 Update CHSI automation outputs - $(date +%Y-%m-%d)"
-          git push origin HEAD:${{ github.ref_name }}
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "🤖 Update CHSI automation outputs - $(date +%Y-%m-%d)"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
 
       - name: Upload outputs artifact
         if: always()
