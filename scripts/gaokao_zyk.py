@@ -4,9 +4,10 @@ import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import parse_qs, urljoin, urlparse
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 BASE_URL = "https://gaokao.chsi.com.cn/zyk/zybk/"
@@ -21,10 +22,6 @@ LEVEL_NAMES = [
 SAVE_DEBUG = os.getenv("SAVE_DEBUG", "0") == "1"
 SCRAPE_DETAILS = os.getenv("SCRAPE_DETAILS", "1") == "1"
 SCRAPE_SCHOOLS = os.getenv("SCRAPE_SCHOOLS", "1") == "1"
-
-SCHOOL_NAME_RE = re.compile(
-    r"(大学|学院|学校|职业大学|职业学院|高等专科学校|师范大学|师范学院|医学院|中医药大学)$"
-)
 
 NAV_BLACKLIST = {
     "首页", "高考资讯", "阳光志愿", "高招咨询", "招生动态", "试题评析", "院校库", "专业库",
@@ -52,6 +49,10 @@ SATISFACTION_LABELS = [
     "就业满意度",
 ]
 
+SCHOOL_NAME_RE = re.compile(
+    r"(大学|学院|学校|职业大学|职业学院|高等专科学校|师范大学|师范学院|医学院|中医药大学)$"
+)
+
 
 def ensure_output():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -67,6 +68,10 @@ def clean_text(text):
     return " ".join(str(text).split()).strip()
 
 
+def normalize_lines(text):
+    return [clean_text(x) for x in (text or "").splitlines() if clean_text(x)]
+
+
 def unique_keep_order(items):
     seen = set()
     out = []
@@ -80,14 +85,33 @@ def unique_keep_order(items):
 
 
 def save_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save_debug(page, name: str):
     if not SAVE_DEBUG:
         return
-    page.screenshot(path=str(OUTPUT_DIR / f"{name}.png"), full_page=True)
-    (OUTPUT_DIR / f"{name}.html").write_text(page.content(), encoding="utf-8")
+    try:
+        page.screenshot(path=str(OUTPUT_DIR / f"{name}.png"), full_page=True)
+    except Exception:
+        pass
+    try:
+        (OUTPUT_DIR / f"{name}.html").write_text(page.content(), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def write_partial(flat_majors):
+    save_json(
+        OUTPUT_DIR / "majors-flat.partial.json",
+        {
+            "抓取时间": iso_now(),
+            "来源": BASE_URL,
+            "数量": len(flat_majors),
+            "专业列表": flat_majors,
+        },
+    )
 
 
 def wait_ready(page):
@@ -104,11 +128,49 @@ def wait_ready(page):
         timeout=60000,
     )
     page.wait_for_selector(".index-cc-list", timeout=30000)
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(1200)
 
 
-def get_level_locator(page):
-    return page.locator(".index-cc-list li")
+def wait_table(page):
+    page.wait_for_selector(".zyk-table-con .ivu-table-body tbody tr", timeout=30000)
+    page.wait_for_function(
+        """
+        () => {
+            const rows = document.querySelectorAll('.zyk-table-con .ivu-table-body tbody tr');
+            if (!rows.length) return false;
+
+            const loading =
+                document.querySelector('.ivu-spin-spinning') ||
+                document.querySelector('.ivu-spin-show-text');
+
+            return !loading;
+        }
+        """,
+        timeout=30000,
+    )
+    page.wait_for_timeout(600)
+
+
+def get_level_texts(page):
+    items = page.locator(".index-cc-list li")
+    out = []
+    for i in range(items.count()):
+        txt = clean_text(items.nth(i).inner_text())
+        if txt:
+            out.append(txt)
+    return out
+
+
+def click_level_by_text(page, level_name: str):
+    items = page.locator(".index-cc-list li")
+    for i in range(items.count()):
+        item = items.nth(i)
+        txt = clean_text(item.inner_text())
+        if txt == level_name:
+            item.click()
+            page.wait_for_timeout(1000)
+            return
+    raise RuntimeError(f"未找到培养层次：{level_name}")
 
 
 def get_group(page, idx: int):
@@ -117,12 +179,12 @@ def get_group(page, idx: int):
 
 def get_group_items_texts(group):
     items = group.locator("ul.zyk-lb-ul > li")
-    texts = []
+    out = []
     for i in range(items.count()):
         txt = clean_text(items.nth(i).inner_text())
         if txt:
-            texts.append(txt)
-    return texts
+            out.append(txt)
+    return out
 
 
 def click_group_item_by_text(group, text: str):
@@ -136,22 +198,6 @@ def click_group_item_by_text(group, text: str):
     raise RuntimeError(f"未找到分组项：{text}")
 
 
-def click_level_by_text(page, level_name: str):
-    items = get_level_locator(page)
-    for i in range(items.count()):
-        item = items.nth(i)
-        txt = clean_text(item.inner_text())
-        if txt == level_name:
-            item.click()
-            return
-    raise RuntimeError(f"未找到培养层次：{level_name}")
-
-
-def wait_table(page):
-    page.wait_for_selector(".zyk-table-con .ivu-table-body tbody tr", timeout=30000)
-    page.wait_for_timeout(1000)
-
-
 def extract_spec_id(detail_href: str, school_href: str):
     for url in [detail_href, school_href]:
         if not url:
@@ -162,43 +208,45 @@ def extract_spec_id(detail_href: str, school_href: str):
         m = re.search(r"/detail/(\d+)", url)
         if m:
             return m.group(1)
-        m = re.search(r"detail(\d+)", url)
-        if m:
-            return m.group(1)
     return ""
 
 
 def extract_table_rows(page, level_name, discipline, major_class):
+    row_data = page.locator(".zyk-table-con .ivu-table-body tbody tr").evaluate_all(
+        """
+        rows => rows.map(tr => {
+            const tds = Array.from(tr.querySelectorAll('td'));
+            const majorA = tds[0]?.querySelector('a');
+            const schoolA = tds[2]?.querySelector('a');
+
+            return {
+                cell_count: tds.length,
+                major_name: (tds[0]?.innerText || '').trim(),
+                major_code: (tds[1]?.innerText || '').trim(),
+                school_text: (tds[2]?.innerText || '').trim(),
+                satisfaction: (tds[3]?.innerText || '').trim(),
+                detail_href: majorA?.getAttribute('href') || '',
+                school_href: schoolA?.getAttribute('href') || '',
+            };
+        })
+        """
+    )
+
     rows = []
-    tr_list = page.locator(".zyk-table-con .ivu-table-body tbody tr")
-    for i in range(tr_list.count()):
-        tr = tr_list.nth(i)
-        tds = tr.locator("td")
-        if tds.count() < 4:
+    for item in row_data:
+        if item.get("cell_count", 0) < 4:
             continue
 
-        major_name = clean_text(tds.nth(0).inner_text())
-        major_code = clean_text(tds.nth(1).inner_text())
-        school_text = clean_text(tds.nth(2).inner_text())
-        satisfaction = clean_text(tds.nth(3).inner_text())
+        major_name = clean_text(item.get("major_name", ""))
+        major_code = clean_text(item.get("major_code", ""))
+        school_text = clean_text(item.get("school_text", ""))
+        satisfaction = clean_text(item.get("satisfaction", ""))
 
         if not major_name or "暂无" in major_name:
             continue
 
-        detail_href = ""
-        school_href = ""
-
-        a1 = tds.nth(0).locator("a")
-        if a1.count() > 0:
-            href = a1.first.get_attribute("href")
-            if href:
-                detail_href = urljoin(BASE_URL, href)
-
-        a2 = tds.nth(2).locator("a")
-        if a2.count() > 0:
-            href = a2.first.get_attribute("href")
-            if href:
-                school_href = urljoin(BASE_URL, href)
+        detail_href = urljoin(BASE_URL, item.get("detail_href", "")) if item.get("detail_href") else ""
+        school_href = urljoin(BASE_URL, item.get("school_href", "")) if item.get("school_href") else ""
 
         spec_id = extract_spec_id(detail_href, school_href)
         if not school_href and spec_id:
@@ -211,16 +259,13 @@ def extract_table_rows(page, level_name, discipline, major_class):
             "专业名称": major_name,
             "专业代码": major_code,
             "专业满意度": satisfaction,
+            "开设院校文本": school_text,
             "详情页": detail_href,
             "开设院校页": school_href,
             "specId": spec_id,
         })
+
     return rows
-
-
-def normalize_lines(text):
-    lines = [clean_text(x) for x in (text or "").splitlines()]
-    return [x for x in lines if x]
 
 
 def find_title_and_level(lines):
@@ -240,10 +285,7 @@ def extract_section(lines, heading, all_headings):
     try:
         start = lines.index(heading)
     except ValueError:
-        return {
-            "raw_text": "",
-            "lines": []
-        }
+        return {"raw_text": "", "lines": []}
 
     end = len(lines)
     for i in range(start + 1, len(lines)):
@@ -254,7 +296,7 @@ def extract_section(lines, heading, all_headings):
     content_lines = lines[start + 1:end]
     return {
         "raw_text": "\n".join(content_lines).strip(),
-        "lines": content_lines
+        "lines": content_lines,
     }
 
 
@@ -328,11 +370,7 @@ def parse_nearby_majors(page, current_spec_id):
             sid = m.group(1)
         if sid and sid == current_spec_id:
             continue
-        items.append({
-            "名称": text,
-            "链接": full,
-            "specId": sid,
-        })
+        items.append({"名称": text, "链接": full, "specId": sid})
     return unique_keep_order(items)
 
 
@@ -389,14 +427,15 @@ def parse_employment_directions(section_lines):
 def extract_detail(context, major_row):
     if not major_row["详情页"]:
         return {
-            "error": "missing_detail_url"
+            "error": "missing_detail_url",
+            "抓取时间": iso_now(),
         }
 
     current_spec_id = major_row.get("specId", "")
     detail_page = context.new_page()
     try:
         detail_page.goto(major_row["详情页"], wait_until="domcontentloaded", timeout=60000)
-        detail_page.wait_for_timeout(1800)
+        detail_page.wait_for_timeout(1500)
         text = detail_page.locator("body").inner_text(timeout=30000)
         lines = normalize_lines(text)
 
@@ -479,7 +518,7 @@ def extract_school_rows(context, major_row):
 
     try:
         page.goto(major_row["开设院校页"], wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(1800)
 
         page_no = 1
         while True:
@@ -510,7 +549,7 @@ def extract_school_rows(context, major_row):
                 break
 
             next_btn.first.click()
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1000)
             page_no += 1
 
         return {
@@ -563,10 +602,7 @@ def build_hierarchy(levels_data, flat_rows):
     final_levels = []
     for level_name in levels_data:
         if level_name not in level_map:
-            final_levels.append({
-                "名称": level_name,
-                "门类列表": []
-            })
+            final_levels.append({"名称": level_name, "门类列表": []})
             continue
 
         level_obj = level_map[level_name]
@@ -623,66 +659,83 @@ def run():
             wait_ready(page)
             save_debug(page, "01_ready")
 
-            level_items = get_level_locator(page)
-            all_level_texts = []
-            for i in range(level_items.count()):
-                txt = clean_text(level_items.nth(i).inner_text())
-                if txt:
-                    all_level_texts.append(txt)
-
+            all_level_texts = get_level_texts(page)
             for level_name in LEVEL_NAMES:
                 if level_name in all_level_texts:
                     levels_found.append(level_name)
 
             for level_name in levels_found:
+                print(f"[INFO] 进入培养层次: {level_name}")
                 click_level_by_text(page, level_name)
-                page.wait_for_timeout(1500)
 
                 discipline_group = get_group(page, 0)
                 class_group = get_group(page, 1)
-
                 discipline_texts = get_group_items_texts(discipline_group)
 
                 for discipline in discipline_texts:
+                    print(f"[INFO] 进入门类: {level_name} / {discipline}")
+                    discipline_group = get_group(page, 0)
                     click_group_item_by_text(discipline_group, discipline)
-                    page.wait_for_timeout(1200)
+                    page.wait_for_timeout(800)
 
+                    class_group = get_group(page, 1)
                     class_texts = get_group_items_texts(class_group)
+
                     for major_class in class_texts:
-                        click_group_item_by_text(class_group, major_class)
-                        wait_table(page)
+                        try:
+                            print(f"[INFO] 进入专业类: {level_name} / {discipline} / {major_class}")
+                            class_group = get_group(page, 1)
+                            click_group_item_by_text(class_group, major_class)
+                            wait_table(page)
 
-                        rows = extract_table_rows(page, level_name, discipline, major_class)
-                        for row in rows:
-                            key = row["specId"] or (row["培养层次"], row["门类"], row["专业类"], row["专业名称"], row["专业代码"])
-                            if key in seen_major:
-                                continue
-                            seen_major.add(key)
+                            rows = extract_table_rows(page, level_name, discipline, major_class)
+                            print(f"[INFO] 表格行数: {len(rows)}")
 
-                            if SCRAPE_DETAILS:
-                                row["详情"] = extract_detail(context, row)
-                            else:
-                                row["详情"] = {}
+                            for row in rows:
+                                key = row["specId"] or (
+                                    row["培养层次"],
+                                    row["门类"],
+                                    row["专业类"],
+                                    row["专业名称"],
+                                    row["专业代码"],
+                                )
+                                if key in seen_major:
+                                    continue
+                                seen_major.add(key)
 
-                            if SCRAPE_SCHOOLS:
-                                row["开设院校"] = extract_school_rows(context, row)
-                            else:
-                                row["开设院校"] = {
-                                    "来源页": row.get("开设院校页", ""),
-                                    "学校数量": 0,
-                                    "学校列表": [],
-                                }
+                                if SCRAPE_DETAILS:
+                                    row["详情"] = extract_detail(context, row)
+                                else:
+                                    row["详情"] = {}
 
-                            flat_majors.append(row)
+                                if SCRAPE_SCHOOLS:
+                                    row["开设院校"] = extract_school_rows(context, row)
+                                else:
+                                    row["开设院校"] = {
+                                        "来源页": row.get("开设院校页", ""),
+                                        "学校数量": 0,
+                                        "学校列表": [],
+                                    }
+
+                                flat_majors.append(row)
+
+                            write_partial(flat_majors)
+
+                        except Exception as e:
+                            print(f"[WARN] 跳过专业类: {level_name} / {discipline} / {major_class} -> {repr(e)}")
+                            write_partial(flat_majors)
+                            continue
 
             save_debug(page, "02_done")
 
-        except PlaywrightTimeoutError:
+        except PlaywrightTimeoutError as e:
             save_debug(page, "timeout")
-            raise
-        except Exception:
+            write_partial(flat_majors)
+            raise e
+        except Exception as e:
             save_debug(page, "error")
-            raise
+            write_partial(flat_majors)
+            raise e
         finally:
             context.close()
             browser.close()
